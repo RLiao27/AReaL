@@ -425,6 +425,11 @@ def create_app(config: DataProxyConfig) -> FastAPI:
 
         kwargs = dict(body_json)
         kwargs.pop("model", None)
+        chat_template_kwargs = kwargs.pop("chat_template_kwargs", None)
+        if chat_template_kwargs is not None:
+            extra_body = dict(kwargs.get("extra_body") or {})
+            extra_body["chat_template_kwargs"] = chat_template_kwargs
+            kwargs["extra_body"] = extra_body
         is_streaming = bool(kwargs.get("stream", False))
         kwargs.setdefault("temperature", 1.0)
         kwargs.setdefault("top_p", 1.0)

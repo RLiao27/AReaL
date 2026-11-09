@@ -374,11 +374,10 @@ class PPOTrainer:
         self._proxy_started = False
 
         # Prepare weight update meta and connect to inference engine.
-        # v2 controllers pick transport from use_lora: LoRA must go through
-        # disk (P2P transports cannot carry PEFT-wrapped tensors); non-LoRA
-        # uses awex. v1 keeps the legacy weight_update_mode dispatch.
+        # LoRA must use disk; full-model v2 updates default to AWEX unless
+        # disk was explicitly selected.
         if self.config.actor._version == "v2":
-            if config.actor.use_lora:
+            if config.actor.use_lora or config.actor.weight_update_mode == "disk":
                 disk_kwargs: dict[str, Any] = {
                     "experiment_name": config.experiment_name,
                     "trial_name": config.trial_name,

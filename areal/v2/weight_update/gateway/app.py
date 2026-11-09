@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+import shutil
 import socket
 import time
 from contextlib import asynccontextmanager
@@ -36,6 +37,7 @@ class ConnectRequest(BaseModel):
     nccl_master_port: int = 0
     mode: str = "awex"  # "awex" or "disk"
     save_path: str = ""
+    clear_checkpoint_after_load: bool = False
     use_lora: bool = False
     lora_name: str = ""
     lora_keep_versions: int = 0
@@ -228,6 +230,7 @@ def create_app(config: WeightUpdateConfig | None = None) -> FastAPI:
                 inference_worker_urls=inference_urls,
                 mode="disk",
                 save_path=body.save_path,
+                clear_checkpoint_after_load=body.clear_checkpoint_after_load,
                 use_lora=body.use_lora,
                 lora_name=body.lora_name,
                 lora_keep_versions=body.lora_keep_versions,
@@ -700,6 +703,10 @@ def create_app(config: WeightUpdateConfig | None = None) -> FastAPI:
                     for url in pair_info.inference_worker_urls
                 ]
             )
+            if pair_info.clear_checkpoint_after_load:
+                if os.path.islink(save_path):
+                    raise ValueError("Refusing to remove a symlinked weight checkpoint")
+                await asyncio.to_thread(shutil.rmtree, save_path)
 
     @app.post("/update_weights")
     async def update_weights(
