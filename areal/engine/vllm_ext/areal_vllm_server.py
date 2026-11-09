@@ -15,11 +15,20 @@ from vllm.entrypoints.openai.completion.api_router import (
 )
 from vllm.entrypoints.openai.completion.protocol import CompletionRequest
 from vllm.entrypoints.openai.engine.protocol import ErrorResponse, OpenAIBaseModel
-from vllm.entrypoints.openai.utils import validate_json_request
-from vllm.entrypoints.utils import cli_env_setup, load_aware_call, with_cancellation
 from vllm.logger import init_logger
 from vllm.lora.request import LoRARequest
 from vllm.utils.argparse_utils import FlexibleArgumentParser
+
+try:
+    from vllm.entrypoints.serve.utils.api_utils import (
+        cli_env_setup,
+        load_aware_call,
+        validate_json_request,
+        with_cancellation,
+    )
+except ImportError:
+    from vllm.entrypoints.openai.utils import validate_json_request
+    from vllm.entrypoints.utils import cli_env_setup, load_aware_call, with_cancellation
 
 # AReaL's own router for custom endpoints (replaces vLLM's removed global router)
 router = APIRouter()
@@ -162,6 +171,7 @@ def _register_runtime_lora_name(
 
 
 @router.post("/areal_update_weights")
+@router.post("/update_weights_from_disk")
 async def areal_update_weight(request: UpdateWeightsRequest, raw_request: Request):
     logger.info(f"API server starts areal_update_weight, {request.model_path}")
     llm = raw_request.app.state.engine_client

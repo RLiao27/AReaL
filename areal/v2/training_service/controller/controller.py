@@ -1003,6 +1003,7 @@ class GatewayTrainController:
                 inference_worker_urls=inference_urls,
                 mode="disk",
                 save_path=meta.path or "",
+                clear_checkpoint_after_load=meta.clear_checkpoint_after_load,
                 use_lora=meta.use_lora,
                 lora_name=meta.lora_name,
                 lora_keep_versions=meta.lora_keep_versions,
@@ -1025,6 +1026,8 @@ class GatewayTrainController:
             f"meta.version must be a positive integer, got {meta.version}"
         )
         result = self._weight_update_ctrl.update_weights(version=meta.version)
+        if result.status != "ok":
+            raise RuntimeError(f"Weight update v{meta.version} failed: {result.error}")
         self.rollout.continue_generation()
         logger.info(
             "Weight update v%d completed (%s, %.0fms)",

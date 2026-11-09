@@ -224,6 +224,51 @@ class TestDiskUpdateWeights:
         )
         assert resp.status_code == 404
 
+    def test_cleanup_occurs_only_after_successful_reload(self, client, app, tmp_path):
+        pair = app.state.registry.get_by_name("test_disk")
+        pair.save_path = str(tmp_path)
+        pair.clear_checkpoint_after_load = True
+        checkpoint = tmp_path / "weight_update_v1"
+        checkpoint.mkdir()
+        (checkpoint / "weights").write_text("temporary")
+        app.state.http_session = _make_mock_aiohttp_session([])
+
+        response = client.post(
+            "/update_weights",
+            json={"pair_name": "test_disk", "version": 1},
+            headers=ADMIN_HEADERS,
+        )
+
+        assert response.json()["status"] == "ok"
+        assert not checkpoint.exists()
+
+    def test_failed_reload_preserves_checkpoint(self, client, app, tmp_path):
+        pair = app.state.registry.get_by_name("test_disk")
+        pair.save_path = str(tmp_path)
+        pair.clear_checkpoint_after_load = True
+        checkpoint = tmp_path / "weight_update_v1"
+        checkpoint.mkdir()
+        (checkpoint / "weights").write_text("temporary")
+        session = _make_mock_aiohttp_session([])
+
+        @asynccontextmanager
+        async def fail_reload(url, **kwargs):
+            if url.endswith("/update_weights_from_disk"):
+                raise ValueError("reload failed")
+            async with _make_mock_aiohttp_session([]).post(url, **kwargs) as response:
+                yield response
+
+        session.post = fail_reload
+        app.state.http_session = session
+        response = client.post(
+            "/update_weights",
+            json={"pair_name": "test_disk", "version": 1},
+            headers=ADMIN_HEADERS,
+        )
+
+        assert response.json()["status"] == "error"
+        assert (checkpoint / "weights").exists()
+
 
 class TestDiskUpdateWeightsLora:
     @pytest.fixture(autouse=True)

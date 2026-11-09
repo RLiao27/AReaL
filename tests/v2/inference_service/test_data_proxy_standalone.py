@@ -217,6 +217,22 @@ class TestStandaloneChat:
         call_kwargs = mock_areal_client.chat.completions.create.call_args
         assert call_kwargs.kwargs.get("areal_cache") is None
 
+    @pytest.mark.asyncio
+    async def test_chat_template_kwargs_are_forwarded(self, client, mock_areal_client):
+        response = await client.post(
+            "/chat/completions",
+            json={
+                "model": "sglang",
+                "messages": [{"role": "user", "content": "hello"}],
+                "chat_template_kwargs": {"enable_thinking": False},
+            },
+        )
+        assert response.status_code == 200
+        kwargs = mock_areal_client.chat.completions.create.await_args.kwargs
+        assert kwargs["extra_body"]["chat_template_kwargs"] == {
+            "enable_thinking": False
+        }
+
 
 # =============================================================================
 # Session-key flows unchanged

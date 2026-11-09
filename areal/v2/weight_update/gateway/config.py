@@ -57,6 +57,7 @@ class PairInfo:
     # Disk-mode fields (used when mode="disk")
     mode: str = "awex"  # "awex" or "disk"
     save_path: str = ""
+    clear_checkpoint_after_load: bool = False
     use_lora: bool = False
     lora_name: str = ""
     # Number of recent LoRA adapter versions to keep loaded on each inference

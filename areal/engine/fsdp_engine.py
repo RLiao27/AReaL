@@ -1982,6 +1982,10 @@ class FSDPEngine(TrainEngine):
                 is_qwen3_moe_model(self.model_config.model_type)
                 or is_qwen3_vl_model(self.model_config.model_type)
                 or is_qwen3_5_model(self.model_config.model_type)
+                or (
+                    self.model_config.model_type == "qwen3"
+                    and self.config.attn_impl == "sdpa"
+                )
             ):
                 mb["attention_mask"] = None
                 padded_mb["attention_mask"] = None

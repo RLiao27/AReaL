@@ -116,6 +116,7 @@ class WeightUpdateController:
         colocate: bool = False,
         nccl_master_addr: str = "",
         nccl_master_port: int = 0,
+        clear_checkpoint_after_load: bool = False,
     ) -> None:
         self._pair_name = pair_name
         payload: dict[str, Any] = {
@@ -124,6 +125,7 @@ class WeightUpdateController:
             "inference_worker_urls": inference_worker_urls,
             "mode": mode,
             "save_path": save_path,
+            "clear_checkpoint_after_load": clear_checkpoint_after_load,
             "use_lora": use_lora,
             "lora_name": lora_name,
             "lora_keep_versions": lora_keep_versions,
