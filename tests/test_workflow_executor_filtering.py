@@ -1,13 +1,15 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import asyncio
+import json
 from unittest.mock import AsyncMock, MagicMock, call
 
 import pytest
 import torch
 
-from areal.api import RolloutWorkflow
+from areal.api import ModelResponse, RolloutWorkflow
 from areal.api.cli_args import InferenceEngineConfig
+from areal.experimental.openai.types import InteractionWithTokenLogpReward
 from areal.infra.rpc.rtensor import RTensor, TensorShardInfo
 from areal.infra.workflow_executor import WorkflowExecutor, _RolloutTaskInput
 
@@ -51,6 +53,40 @@ def _executor():
 
 
 @pytest.mark.asyncio
+async def test_dump_plain_interaction_accepts_rollout_and_writes_file(tmp_path):
+    """Default interactions must not be rejected merely because dumping is enabled."""
+    interaction = InteractionWithTokenLogpReward(
+        model_response=ModelResponse(
+            input_tokens=[1],
+            output_tokens=[2],
+            output_logprobs=[-0.1],
+            output_versions=[0],
+            stop_reason="stop",
+        ),
+        reward=1.0,
+    )
+    executor, manager = _executor()
+    executor.config.dump_to_file = True
+    executor._get_dump_dir = lambda _is_eval: str(tmp_path)
+    executor._get_tokenizer = lambda: MagicMock(
+        decode=lambda ids, skip_special_tokens=False: str(ids)
+    )
+    task = executor._create_workflow_task(
+        _RolloutTaskInput(
+            task_id=1, data={}, workflow=_TrajectoryWorkflow({"turn": interaction})
+        )
+    )
+
+    result = await task()
+
+    assert result is not None
+    manager.on_rollout_accepted.assert_called_once_with()
+    manager.on_rollout_rejected.assert_not_called()
+    record = json.loads((tmp_path / "0" / "1.jsonl").read_text())
+    assert record["reward"] == 1.0
+
+
+@pytest.mark.asyncio
 async def test_filter_accepts_local_rewards_without_clearing_remote_payload(
     monkeypatch,
 ):
@@ -72,7 +108,8 @@ async def test_filter_accepts_local_rewards_without_clearing_remote_payload(
     result = await task()
 
     assert result is not None
-    assert result.trajectory is trajectory
+    assert result.trajectory["input_ids"] is trajectory["input_ids"]
+    assert result.trajectory["rollout_group"].row_counts == (2,)
     assert isinstance(result.trajectory["input_ids"], RTensor)
     manager.on_rollout_accepted.assert_called_once_with()
     clear_node.assert_not_awaited()
@@ -106,7 +143,9 @@ async def test_filter_rejection_or_failure_clears_remote_payload(
 
     result = await task()
 
-    assert result is None
+    assert result is not None
+    assert result.trajectory is None
+    assert result.metrics["rollout/rejected"] == [1.0]
     manager.on_rollout_rejected.assert_called_once_with()
     clear_node.assert_has_awaits(
         [
@@ -144,7 +183,9 @@ async def test_filter_rejection_times_out_blocked_remote_cleanup(monkeypatch):
 
     result = await asyncio.wait_for(task(), timeout=1.0)
 
-    assert result is None
+    assert result is not None
+    assert result.trajectory is None
+    assert result.metrics["rollout/rejected"] == [1.0]
     manager.on_rollout_rejected.assert_called_once_with()
     assert cleared == [("node-b:1234", ["mask"])]
     executor.logger.warning.assert_called_once_with(

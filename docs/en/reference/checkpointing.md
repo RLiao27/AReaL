@@ -36,7 +36,17 @@ Used by `RecoverHandler` for fault tolerance:
 - Includes model weights, optimizer state, RNG state, etc
 - Backend-specific: checkpoints are only compatible with the same parallelism
   configuration
-- Overwrites previous checkpoint to save disk space
+- In single-controller mode, writes an immutable generation and atomically publishes it
+  through a `LATEST` pointer
+- Retains the legacy overwrite layout in SPMD mode
+
+FSDP checkpoints saved with `with_optim=True` also contain `lr_scheduler.pt`, which
+restores learning-rate scheduler progress alongside the optimizer. This applies to both
+DCP and HF training checkpoints. Keep the scheduler configuration and total training
+steps unchanged when resuming. Older checkpoints without this file remain loadable, but
+emit a warning and leave the current scheduler unchanged; their original learning-rate
+trajectory cannot be restored exactly. Model-only loading (`with_optim=False`) does not
+restore scheduler state.
 
 ## Architecture
 
@@ -186,25 +196,29 @@ RecoverHandler saves complete training state:
 
 ### Output Location
 
-Recovery checkpoints are saved to:
+In single-controller mode, recovery checkpoints are saved as immutable generations:
 
 ```
 {fileroot}/checkpoints/{user}/{experiment_name}/{trial_name}/
-├── default/
-│   └── recover_checkpoint/     # Model + optimizer (DCP format)
-│       ├── __0_0.distcp
-│       ├── __1_0.distcp
-│       └── ...
-├── critic/                     # If using critic
-│   └── recover_checkpoint/
-└── recover_info/               # Metadata
-    ├── step_info.json
-    ├── saver_info.json
-    ├── evaluator_info.json
-    ├── stats_logger_info.json
-    ├── checkpoint_info.json
-    └── dataloader_info.pkl
+├── LATEST                      # Atomic JSON pointer to one complete generation
+└── checkpoint_generations/
+    └── generation_step00000123/
+        ├── manifest/           # Dataloader and training progress metadata
+        └── payloads/
+            ├── default/        # Model + optimizer (DCP format)
+            └── critic/         # Present when a critic is checkpointed
 ```
+
+The pointer is updated only after every payload is durable. When a generation contains
+multiple train engines, `RecoverHandler` drains all but one asynchronous save before
+scheduling the final asynchronous engine. Publication is appended only to that engine's
+MCore finalize callback, so one background save can still overlap training without
+exposing a partially written actor/critic generation. A crash may leave an unpublished
+generation on disk, but recovery continues to use the generation selected by `LATEST`.
+The previous published generation is removed after the pointer switches successfully.
+
+SPMD trainers keep the pre-pointer `recover_info/` and `<engine>/recover_checkpoint/`
+layout for compatibility. Recovery can read both layouts.
 
 ### Recovery Process
 
@@ -230,12 +244,16 @@ When training resumes:
 
 - **Saver**: Each save creates a new directory. High frequency consumes significant
   space.
-- **RecoverHandler**: Overwrites previous checkpoint. Only one copy exists at a time.
+- **RecoverHandler**: Normally keeps one published generation plus any in-progress or
+  crash-abandoned generation. SPMD mode continues to overwrite the legacy paths.
 
 ### Recovery Tips
 
-1. **Verify checkpoint validity**: Check `recover_info/step_info.json` for the last
-   saved step
+1. **Verify checkpoint validity**: Read `LATEST`, then inspect the selected generation's
+   `manifest/step_info.json`
 1. **Same config required**: DCP checkpoints require identical parallelism
    configuration, experiment name, and trial name
-1. **Clean restart**: Delete `recover_info/` directory to start fresh
+1. **One writer per trial**: Do not run concurrent checkpoint writers against the same
+   experiment and trial directory
+1. **Clean restart**: Delete both `LATEST` and `checkpoint_generations/`. For a legacy
+   SPMD checkpoint, delete `recover_info/` and each engine's `recover_checkpoint/`

@@ -12,6 +12,8 @@ def _make_microbatch() -> MicroBatchItem:
         "input_ids": torch.tensor([[1, 2, 3]], dtype=torch.long),
         "attention_mask": torch.ones(1, 3, dtype=torch.bool),
         "turn_ids": torch.tensor([[-1, 0, 0]], dtype=torch.int32),
+        "is_truncated": torch.tensor([True]),
+        "_pg_token_weights": torch.tensor([[0.0, 0.5, 0.5]]),
     }
     return MicroBatchItem(
         orig_mb=data,
@@ -21,7 +23,7 @@ def _make_microbatch() -> MicroBatchItem:
     )
 
 
-def test_fsdp_prepare_inputs_strips_turn_ids_without_mutating_context():
+def test_fsdp_prepare_inputs_strips_algorithm_metadata_without_mutating_context():
     """FSDP forwards model fields only while retaining algorithm metadata."""
     engine = FSDPEngine.__new__(FSDPEngine)
     engine.parallel_helper = SimpleNamespace(sp_size=1)
@@ -29,10 +31,14 @@ def test_fsdp_prepare_inputs_strips_turn_ids_without_mutating_context():
     inputs, context = engine._prepare_mb_inputs(_make_microbatch())
 
     assert "turn_ids" not in inputs
+    assert "is_truncated" not in inputs
+    assert "_pg_token_weights" not in inputs
+    assert "_pg_token_weights" in context.mb_input
     assert "turn_ids" in context.mb_input
+    assert "is_truncated" in context.mb_input
 
 
-def test_archon_prepare_inputs_strips_turn_ids_without_mutating_context():
+def test_archon_prepare_inputs_strips_algorithm_metadata_without_mutating_context():
     """Archon forwards model fields only while retaining algorithm metadata."""
     pytest.importorskip("triton", reason="Archon import requires Triton")
     from areal.experimental.engine.archon_engine import ArchonEngine
@@ -44,4 +50,8 @@ def test_archon_prepare_inputs_strips_turn_ids_without_mutating_context():
     inputs, context = engine._prepare_mb_inputs(_make_microbatch())
 
     assert "turn_ids" not in inputs
+    assert "is_truncated" not in inputs
+    assert "_pg_token_weights" not in inputs
+    assert "_pg_token_weights" in context.mb_input
     assert "turn_ids" in context.mb_input
+    assert "is_truncated" in context.mb_input

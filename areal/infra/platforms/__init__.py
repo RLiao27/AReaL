@@ -3,7 +3,10 @@
 from __future__ import annotations
 
 import torch
-from transformers.utils.import_utils import is_torch_npu_available
+from transformers.utils.import_utils import (
+    is_torch_npu_available,
+    is_torch_xpu_available,
+)
 
 import areal.utils.logging as logging
 
@@ -11,12 +14,15 @@ from .cpu import CpuPlatform
 from .cuda import CudaPlatform
 from .npu import NPUPlatform
 from .platform import Platform
+from .rocm import ROCmPlatform
 from .unknown import UnknownPlatform
+from .xpu import XpuPlatform
 
 logger = logging.getLogger("PlatformInit")
 
 
 is_npu_available = is_torch_npu_available()
+is_xpu_available = is_torch_xpu_available()
 
 
 def _init_platform() -> Platform:
@@ -24,22 +30,31 @@ def _init_platform() -> Platform:
     Detect and initialize the appropriate platform based on available devices.
     Priority:
     1. CUDA (NVIDIA)
-    2. TODO: NPU (if torch_npu is installed)
-    3. CPU (fallback)
+    2. ROCm (AMD)
+    3. NPU (if torch_npu is installed)
+    4. XPU (Intel)
+    5. CPU (fallback)
     Returns:
         An instance of a subclass of Platform corresponding to the detected hardware.
     """
     if torch.cuda.is_available():
         device_name = torch.cuda.get_device_name().upper()
-        logger.info(f"Detected CUDA device: {device_name}")
+        is_rocm = getattr(torch.version, "hip", None) is not None
+        logger.info(f"Detected {'ROCm' if is_rocm else 'CUDA'} device: {device_name}")
         if "NVIDIA" in device_name:
             logger.info("Initializing CUDA platform (NVIDIA).")
             return CudaPlatform()
+        if is_rocm:
+            logger.info("Initializing ROCm platform (AMD).")
+            return ROCmPlatform()
         logger.warning("Unrecognized CUDA device. Falling back to UnknownPlatform.")
         return UnknownPlatform()
     elif is_npu_available:
         logger.info("Initializing NPU platform (NPU).")
         return NPUPlatform()
+    elif is_xpu_available:
+        logger.info("Initializing XPU platform (Intel).")
+        return XpuPlatform()
     else:
         logger.info("No supported accelerator detected. Initializing CPU platform.")
         return CpuPlatform()
@@ -95,4 +110,4 @@ current_platform: Platform | _LazyPlatform = (
 )  # NOTE: This is a proxy, not a subclass of Platform.
 
 
-__all__ = ["Platform", "current_platform", "is_npu_available"]
+__all__ = ["Platform", "current_platform", "is_npu_available", "is_xpu_available"]

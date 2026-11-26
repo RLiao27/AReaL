@@ -1,6 +1,7 @@
 """Test suite for remote inference engines (vLLM and SGLang)."""
 
 import os
+from types import SimpleNamespace
 
 import pytest
 import torch.distributed as dist
@@ -25,6 +26,227 @@ MODEL_PATH = get_model_path(
 
 IS_VLLM_INSTALLED = is_available("vllm")
 IS_SGLANG_INSTALLED = is_available("sglang")
+
+
+@pytest.mark.parametrize(
+    ("env", "gpus_per_server", "fallback", "expected", "source"),
+    [
+        ({"CUDA_VISIBLE_DEVICES": "7"}, 1, 7, 0, "CUDA_VISIBLE_DEVICES"),
+        (
+            {"CUDA_VISIBLE_DEVICES": "4,5,6,7", "SLURM_LOCALID": "1"},
+            4,
+            4,
+            0,
+            "CUDA_VISIBLE_DEVICES",
+        ),
+        (
+            {"CUDA_VISIBLE_DEVICES": "GPU-a,GPU-b"},
+            2,
+            2,
+            0,
+            "CUDA_VISIBLE_DEVICES",
+        ),
+        ({"SLURM_LOCALID": "2"}, 4, 0, 8, "SLURM_LOCALID"),
+        (
+            {
+                "CUDA_VISIBLE_DEVICES": "0,1,2,3,4,5,6,7",
+                "SLURM_LOCALID": "1",
+            },
+            4,
+            0,
+            4,
+            "SLURM_LOCALID",
+        ),
+        (
+            {
+                "CUDA_VISIBLE_DEVICES": "0,1,2,3,4,5,6,7",
+                "AREAL_SGLANG_BASE_GPU_ID": "4",
+            },
+            4,
+            0,
+            4,
+            "AREAL_SGLANG_BASE_GPU_ID",
+        ),
+        ({}, 1, 6, 6, "controller fallback"),
+    ],
+)
+def test_resolve_colocated_base_gpu_id_supports_scheduler_device_namespaces(
+    env, gpus_per_server, fallback, expected, source
+) -> None:
+    """Colocated SGLang uses logical IDs under scheduler device isolation."""
+    from areal.engine.sglang_remote import _resolve_colocated_base_gpu_id
+
+    resolved, resolved_source = _resolve_colocated_base_gpu_id(
+        env,
+        gpus_per_server,
+        fallback,
+    )
+
+    assert resolved == expected
+    assert resolved_source == source
+
+
+@pytest.mark.parametrize(
+    ("env", "gpus_per_server", "fallback", "error"),
+    [
+        ({}, 0, 0, "gpus_per_server must be positive"),
+        ({"SLURM_LOCALID": "-1"}, 1, 0, "SLURM_LOCALID must be non-negative"),
+        (
+            {"AREAL_SGLANG_BASE_GPU_ID": "-1"},
+            1,
+            0,
+            "AREAL_SGLANG_BASE_GPU_ID must be non-negative",
+        ),
+        (
+            {
+                "CUDA_VISIBLE_DEVICES": "7",
+                "AREAL_SGLANG_BASE_GPU_ID": "3",
+            },
+            1,
+            7,
+            "must be 0 when the worker has an isolated",
+        ),
+    ],
+)
+def test_resolve_colocated_base_gpu_id_rejects_invalid_namespaces(
+    env, gpus_per_server, fallback, error
+) -> None:
+    """Invalid colocated GPU namespaces fail before SGLang starts."""
+    from areal.engine.sglang_remote import _resolve_colocated_base_gpu_id
+
+    with pytest.raises(ValueError, match=error):
+        _resolve_colocated_base_gpu_id(env, gpus_per_server, fallback)
+
+
+def test_sglang_uses_functional_health_check_by_default() -> None:
+    from areal.engine.sglang_remote import SGLangBackend
+
+    assert SGLangBackend().get_health_check_request().endpoint == "/health"
+
+
+def test_sglang_awex_uses_metadata_readiness_check(monkeypatch) -> None:
+    from areal.engine.sglang_remote import SGLangBackend
+
+    backend = SGLangBackend()
+    monkeypatch.setattr(
+        "areal.engine.sglang_remote.SGLangConfig.build_cmd_from_args",
+        lambda args: ["sglang.launch_server"],
+    )
+    monkeypatch.setattr(
+        "areal.engine.sglang_remote.subprocess.Popen",
+        lambda *args, **kwargs: SimpleNamespace(pid=1, poll=lambda: None),
+    )
+
+    backend.launch_server(
+        {"model_path": "model", "awex_meta_server_addr": "127.0.0.1:1234"}
+    )
+
+    assert backend.get_health_check_request().endpoint == "/model_info"
+
+
+def test_wait_for_server_raises_when_subprocess_exits() -> None:
+    from areal.infra.remote_inf_engine import RemoteInfEngine
+
+    engine = RemoteInfEngine(
+        InferenceEngineConfig(setup_timeout=60),
+        backend=SimpleNamespace(),
+    )
+    engine.check_health = lambda _: False
+    process = SimpleNamespace(
+        pid=123,
+        args=["python3", "-m", "sglang.launch_server"],
+        returncode=42,
+        poll=lambda: 42,
+    )
+
+    with pytest.raises(RuntimeError, match="pid=123.*code 42"):
+        engine._wait_for_server("127.0.0.1:1", process=process)
+
+
+def test_awex_sglang_child_drops_training_ld_preload(monkeypatch) -> None:
+    from areal.engine.sglang_remote import SGLangBackend
+
+    backend = SGLangBackend()
+    monkeypatch.setenv("LD_PRELOAD", "/tmp/torch_memory_saver.so")
+    monkeypatch.setenv("TMS_INIT_ENABLE", "1")
+    monkeypatch.setenv("TMS_INIT_ENABLE_CPU_BACKUP", "1")
+    monkeypatch.delenv("AREAL_SGLANG_DROP_LD_PRELOAD", raising=False)
+    monkeypatch.setenv("AWEX_META_SERVER_ADDR", "127.0.0.1:1234")
+
+    captured = {}
+
+    class Process:
+        pid = 1
+
+        def poll(self):
+            return None
+
+    def fake_popen(cmd, *, env, stdout, stderr):
+        captured["cmd"] = cmd
+        captured["env"] = env
+        return Process()
+
+    monkeypatch.setattr("areal.engine.sglang_remote.subprocess.Popen", fake_popen)
+    monkeypatch.setattr(
+        "areal.engine.sglang_remote.SGLangConfig.build_cmd_from_args",
+        lambda args: ["sglang.launch_server"],
+    )
+    backend.launch_server({"model_path": "model"})
+
+    assert "LD_PRELOAD" not in captured["env"]
+    assert "TMS_INIT_ENABLE" not in captured["env"]
+    assert "TMS_INIT_ENABLE_CPU_BACKUP" not in captured["env"]
+
+
+def test_awex_sglang_child_enables_cuda_graph_memory_saver(monkeypatch) -> None:
+    """AWEX enables graph region capture before the SGLang child starts."""
+    from areal.engine.sglang_remote import SGLangBackend
+
+    backend = SGLangBackend()
+    monkeypatch.setenv("AWEX_META_SERVER_ADDR", "127.0.0.1:1234")
+    monkeypatch.delenv("SGLANG_MEMORY_SAVER_CUDA_GRAPH", raising=False)
+    captured = {}
+
+    def fake_popen(cmd, *, env, stdout, stderr):
+        captured["env"] = env
+        return SimpleNamespace(pid=1, poll=lambda: None)
+
+    monkeypatch.setattr("areal.engine.sglang_remote.subprocess.Popen", fake_popen)
+    monkeypatch.setattr(
+        "areal.engine.sglang_remote.SGLangConfig.build_cmd_from_args",
+        lambda args: ["sglang.launch_server"],
+    )
+
+    backend.launch_server({"model_path": "model", "enable_memory_saver": True})
+
+    assert captured["env"]["SGLANG_MEMORY_SAVER_CUDA_GRAPH"] == "1"
+
+
+def test_awex_sglang_child_preserves_dense_transfer_rank_base(monkeypatch) -> None:
+    from areal.engine.sglang_remote import SGLangBackend
+
+    captured = {}
+    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "2,5")
+    monkeypatch.setattr(
+        "areal.engine.sglang_remote.SGLangConfig.build_cmd_from_args",
+        lambda args: ["sglang.launch_server"],
+    )
+    monkeypatch.setattr(
+        "areal.engine.sglang_remote.subprocess.Popen",
+        lambda *args, **kwargs: captured.update(kwargs)
+        or SimpleNamespace(pid=1, poll=lambda: None),
+    )
+
+    SGLangBackend().launch_server(
+        {
+            "model_path": "model",
+            "awex_meta_server_addr": "127.0.0.1:1234",
+            "base_gpu_id": 4,
+            "_awex_gpus_per_server": 2,
+        }
+    )
+
+    assert captured["env"]["AWEX_TRANSFER_RANK_BASE"] == "4"
 
 
 def _dummy_reward_fn(*args, **kwargs):

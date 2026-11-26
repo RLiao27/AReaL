@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 
+import getpass
 import logging.config
 import os
 import threading
@@ -36,6 +37,7 @@ LOG_PREFIX_WIDTH = 10  # Fixed width for alignment in merged.log
 #   - light_green: Stats, Perf, Dataset, Trainers (data/metrics)
 #   - light_cyan/cyan: Engines, Platforms, MCore (compute backends)
 LOGGER_COLORS_EXACT = {
+    "MTPTrainingTest": "light_cyan",
     # Schedulers - blue
     "LocalScheduler": "blue",
     "RayScheduler": "blue",
@@ -44,6 +46,7 @@ LOGGER_COLORS_EXACT = {
     # Launchers - blue
     "LocalLauncher": "blue",
     "RayLauncher": "blue",
+    "RayBootstrap": "blue",
     "SlurmLauncher": "blue",
     "InfCli": "blue",
     # Workflows - purple
@@ -59,6 +62,7 @@ LOGGER_COLORS_EXACT = {
     # Stats/Perf - green
     "StatsLogger": "light_green",
     "StatsTracker": "light_green",
+    "InferenceTargets": "light_green",
     "PerfTracer": "light_green",
     # RPC servers - white
     "SyncRPCServer": "white",
@@ -66,12 +70,15 @@ LOGGER_COLORS_EXACT = {
     "HttpRTensor": "white",
     # Inference wrappers - white
     "SGLangWrapper": "white",
+    "SGLangMTPBridge": "white",
     "VLLMWrapper": "white",
     "RemoteInfEngine": "white",
     "vLLMEngine": "white",
     # Dataset - green
     "Dataset": "light_green",
+    "DataEngineeringRunner": "light_green",
     "CLEVR70KDataset": "light_green",
+    "ViRL39KDataset": "light_green",
     # Trainers - green
     "RLTrainer": "light_green",
     "SFTTrainer": "light_green",
@@ -98,6 +105,7 @@ LOGGER_COLORS_EXACT = {
     "PlatformInit": "light_cyan",
     "CUDAPlatform": "light_cyan",
     "NPUPlatform": "light_cyan",
+    "ROCmPlatform": "light_cyan",
     "UnknownPlatform": "light_cyan",
     # Sandbox backends
     "DaytonaClientManager": "blue",
@@ -109,9 +117,12 @@ LOGGER_COLORS_EXACT = {
     "OpenAIProxy": "light_purple",
     "ToolCallParser": "light_purple",
     "TokenLogpReward": "light_purple",
+    "PRMRunner": "light_purple",
     "ProxyUtils": "light_purple",
     "AReaL-SWEAgent": "light_purple",
+    "ArenaStreamAgent": "light_purple",
     "SWETrain": "light_green",
+    "SWEPrefixMatcher": "light_yellow",
     # Agent Service - purple
     "AgentGateway": "light_purple",
     "AgentBridge": "light_purple",
@@ -126,9 +137,15 @@ LOGGER_COLORS_EXACT = {
     "InferenceRouter": "white",
     "InferenceGateway": "white",
     "RPCGuard": "white",
+    # R3 native router replay - cyan
+    "R3Replay": "light_cyan",
+    "R3Layout": "light_cyan",
     # AWEX weight exchange - cyan (compute backend)
-    "AwexColocate": "light_cyan",
-    "AwexColocateReader": "light_cyan",
+    "AwexMegatronAdapter": "light_cyan",
+    "AwexSGLangAdapter": "light_cyan",
+    "AwexFSDPAdapter": "light_cyan",
+    "MegatronResidency": "light_cyan",
+    "MOPDTeacherPhase": "light_cyan",
     "AwexSGLangPlugin": "light_cyan",
 }
 
@@ -342,6 +359,19 @@ log_config = {
     },
     "disable_existing_loggers": True,
 }
+
+
+def get_experiment_log_path(
+    experiment_name: str | None,
+    trial_name: str | None,
+    fileroot: str | None,
+) -> str:
+    """Create an experiment log directory without importing metrics backends."""
+    if not fileroot or not experiment_name or not trial_name:
+        raise ValueError("fileroot, experiment_name, and trial_name must be provided.")
+    path = f"{fileroot}/logs/{getpass.getuser()}/{experiment_name}/{trial_name}"
+    os.makedirs(path, exist_ok=True)
+    return path
 
 
 def getLogger(

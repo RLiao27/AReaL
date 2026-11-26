@@ -5,11 +5,453 @@ Distributed integration tests live in
 subprocesses and require GPUs.
 """
 
+from types import SimpleNamespace
 from typing import Any
 from unittest.mock import MagicMock
 
 import pytest
 import torch
+
+
+@pytest.mark.parametrize(
+    ("model_type", "with_vision", "supported"),
+    [
+        ("qwen3_5", False, True),
+        ("qwen3_5_moe", False, True),
+        ("qwen3_5", True, True),
+        ("qwen3_5_moe", True, True),
+        ("qwen3_vl", False, False),
+        ("qwen3_vl", True, False),
+    ],
+)
+def test_chunked_model_thd_forward_accepts_qwen35_multimodal(
+    monkeypatch, model_type, with_vision, supported
+):
+    """Qwen3.5 model-owned THD preserves the visual forward before chunking."""
+    from areal.engine import megatron_engine as module
+    from areal.engine.core.model import SequencePackingMode
+    from areal.utils.data import MicroBatchList, MicroBatchSpec
+
+    row = {
+        "input_ids": torch.tensor([1, 2]),
+        "max_seqlen": 2,
+        "cu_seqlens": torch.tensor([0, 2], dtype=torch.int32),
+    }
+    if with_vision:
+        row["pixel_values"] = torch.ones(2, 4)
+    batch = MicroBatchList(
+        data={},
+        mb_spec=MicroBatchSpec(),
+        mbs=[row],
+        padded_mbs=[dict(row)],
+        group_lens=[2],
+        padding_lengths=[0],
+        padded_to_lengths=[2],
+    )
+    engine = module.MegatronEngine.__new__(module.MegatronEngine)
+    engine._ensure_ready = lambda: None
+    engine._r3_enabled = False
+    engine._r3_pending_routed_experts = None
+    engine._r3_pending_valid = None
+    engine.tf_config = SimpleNamespace(num_moe_experts=None)
+    engine.mcore_config = SimpleNamespace(
+        enable_mtp_training=False, enable_chunked_logits=True, lm_head_loss_chunk_size=2
+    )
+    engine.config = SimpleNamespace(is_critic=False)
+    engine.process_group_initialized = True
+    engine._cpu_group = object()
+    engine.is_vision_model = True
+    engine.enable_tree_training = False
+    engine.device = "cpu"
+    engine.dtype = torch.bfloat16
+    engine.model = [object()]
+    engine.bridge_cls = "megatron-bridge"
+    engine.hf_config = SimpleNamespace(model_type=model_type)
+    engine.sequence_packing_mode = SequencePackingMode.MODEL_THD
+    engine.use_padded_seq = False
+    engine.use_model_packed_seq = True
+
+    class ForwardReached(Exception):
+        pass
+
+    def schedule(**kwargs):
+        kwargs["forward_step_func"](kwargs["data_iterator"], kwargs["model"])
+
+    forward = MagicMock(side_effect=ForwardReached)
+    monkeypatch.setattr(module, "get_forward_backward_func", lambda: schedule)
+    monkeypatch.setattr(
+        module, "validate_transport_padding", lambda *args, **kwargs: None
+    )
+    monkeypatch.setattr(module, "packed_context_parallel_forward", forward)
+    monkeypatch.setattr(module.mpu, "get_context_parallel_world_size", lambda: 1)
+    monkeypatch.setattr(module.mpu, "is_pipeline_last_stage", lambda **kwargs: True)
+
+    error = ForwardReached if supported else NotImplementedError
+    with pytest.raises(error):
+        engine.forward_backward_batch(batch, lambda *args: None, forward_only=True)
+    assert forward.call_count == int(supported)
+
+
+@pytest.mark.parametrize("device", ["cpu", "cuda"])
+@pytest.mark.parametrize(
+    ("cp_size", "cp_rank"), [(1, 0), (4, 0), (4, 1), (4, 2), (4, 3)]
+)
+def test_qwen35_bridge_hidden_mode_preserves_visual_layout_and_gradients(
+    monkeypatch, device, cp_size, cp_rank
+):
+    """Exercise the real Qwen3.5 Bridge wrapper with tiny vision/decoder modules.
+
+    CPU checks visual fusion, THD/CP ordering and autograd. CUDA additionally
+    runs AReaL's production chunked LM Head kernels against a full-logit loss.
+    This is a wrapper/head contract test, not a full Qwen attention/GDN test.
+    """
+    if device == "cuda" and not torch.cuda.is_available():
+        pytest.skip("CUDA is required for the production chunked LM Head kernels")
+
+    from megatron.bridge.models.qwen_vl.modelling_qwen3_vl.model import Qwen3VLModel
+    from megatron.bridge.models.qwen_vl.qwen35_vl_provider import (
+        Qwen35VLMoEModelProvider,
+    )
+
+    from areal.engine.megatron_utils import packed_context_parallel as packing
+    from areal.models.mcore.vocab_parallel_head import _ChunkedVocabParallelLMHead
+
+    # The Qwen3.5 provider uses this shared VLM wrapper; do not substitute a
+    # text-only model that would bypass the image embedding/fusion path.
+    assert Qwen35VLMoEModelProvider.provide.__globals__["Qwen3VLModel"] is Qwen3VLModel
+    torch.manual_seed(1234)
+    hidden_size, vocab_size = 8, 32
+
+    class Embedding(torch.nn.Embedding):
+        def forward(self, input_ids, position_ids=None):
+            return super().forward(input_ids).transpose(0, 1)
+
+    class LanguageModel(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.post_process = True
+            self.rotary_pos_emb = SimpleNamespace(is_thd_format=False)
+            self.embedding = Embedding(vocab_size, hidden_size)
+            self.decoder = torch.nn.Linear(hidden_size, hidden_size, bias=False)
+            self.output_layer = torch.nn.Linear(hidden_size, vocab_size, bias=False)
+
+        def forward(self, *, decoder_input, **kwargs):
+            hidden = self.decoder(decoder_input).tanh()
+            if self.post_process:
+                return self.output_layer(hidden).transpose(0, 1).contiguous()
+            return hidden
+
+    class VisionModel(torch.nn.Linear):
+        def forward(self, *, hidden_states, grid_thw):
+            # Four patches per image merge into one image token.
+            features = super().forward(hidden_states).reshape(2, 4, hidden_size).mean(1)
+            return features, []
+
+    # Avoid allocating the 35B model while retaining the installed Bridge's
+    # actual forward, image replacement, mRoPE and CP packing implementations.
+    model = Qwen3VLModel.__new__(Qwen3VLModel)
+    torch.nn.Module.__init__(model)
+    model.config = SimpleNamespace(
+        hidden_size=hidden_size,
+        params_dtype=torch.float32,
+        sequence_parallel=False,
+        vision_dp_when_cp=False,
+        spatial_merge_size=2,
+    )
+    group = SimpleNamespace(size=lambda: cp_size, rank=lambda: cp_rank)
+    model.pg_collection = SimpleNamespace(
+        cp=group, tp=SimpleNamespace(size=lambda: 1, rank=lambda: 0)
+    )
+    model.pre_process = model.post_process = True
+    model.use_dist_train = False
+    model.image_token_id, model.video_token_id, model.vision_start_token_id = 16, 18, 17
+    model.square_merge_size = 4
+    model.language_model = LanguageModel()
+    model.vision_model = VisionModel(3, hidden_size, bias=False)
+    model.to(device)
+    monkeypatch.setattr(torch.cuda.nvtx, "range_push", lambda *args: None)
+    monkeypatch.setattr(torch.cuda.nvtx, "range_pop", lambda: None)
+    monkeypatch.setattr(packing.mpu, "get_context_parallel_world_size", lambda: cp_size)
+    monkeypatch.setattr(packing.mpu, "get_context_parallel_rank", lambda: cp_rank)
+    monkeypatch.setattr(packing.mpu, "is_pipeline_last_stage", lambda **kwargs: True)
+
+    ids = torch.tensor(
+        [[17, 16, *range(2, 16)], [17, 16, *range(2, 16)]], device=device
+    )
+    pixels = torch.randn(8, 3, device=device, requires_grad=True)
+    inputs = {
+        "input_ids": ids.flatten(),
+        "cu_seqlens": torch.tensor([0, 16, 32], dtype=torch.int32, device=device),
+        "max_seqlen": 16,
+        "pixel_values": pixels,
+        "image_grid_thw": torch.tensor([[1, 2, 2], [1, 2, 2]], device=device),
+    }
+
+    def forward(hidden):
+        return packing.packed_context_parallel_forward(
+            model,
+            inputs,
+            gather_cp_output=False,
+            is_vision_model=True,
+            use_model_packed_seq=True,
+            return_hidden_states=hidden,
+        )
+
+    full_logits = forward(False).reshape(-1, vocab_size)
+    hidden = forward(True)
+    assert model.language_model.post_process is True
+    assert hidden.shape == (32 // cp_size, 1, hidden_size)
+    labels = torch.roll(inputs["input_ids"], shifts=-1)
+    if cp_size > 1:
+        labels = packing.split_packed_seqs_for_context_parallel(
+            labels, inputs["cu_seqlens"]
+        )
+    weight = model.language_model.output_layer.weight
+    if device == "cuda":
+        logprobs = _ChunkedVocabParallelLMHead.apply(
+            hidden,
+            weight,
+            None,
+            labels,
+            1.0,
+            3,
+            False,
+            False,
+            False,
+            None,
+            1.0,
+            True,
+        )[0]
+    else:
+        logprobs = (
+            torch.cat(
+                [
+                    torch.log_softmax(chunk @ weight.t(), dim=-1)
+                    for chunk in hidden.reshape(-1, hidden_size).split(3)
+                ]
+            )
+            .gather(1, labels.reshape(-1, 1))
+            .flatten()
+        )
+    reference = (
+        torch.log_softmax(full_logits, dim=-1)
+        .gather(1, labels.reshape(-1, 1))
+        .flatten()
+    )
+    torch.testing.assert_close(logprobs, reference, rtol=1e-5, atol=2e-5)
+    targets = (
+        pixels,
+        model.vision_model.weight,
+        model.language_model.decoder.weight,
+        weight,
+    )
+    actual_grads = torch.autograd.grad(logprobs.sum(), targets)
+    expected_grads = torch.autograd.grad(reference.sum(), targets)
+    for actual, expected in zip(actual_grads, expected_grads, strict=True):
+        torch.testing.assert_close(actual, expected, rtol=2e-5, atol=2e-5)
+    if cp_rank == 0:
+        assert actual_grads[0].abs().sum() > 0
+
+
+def test_vision_microbatch_preparation_is_lazy_and_reusable(monkeypatch):
+    from areal.engine import megatron_engine as module
+    from areal.engine.core.model import SequencePackingMode
+    from areal.engine.megatron_utils.packed_context_parallel import (
+        prepare_vision_microbatch,
+    )
+    from areal.utils.data import MicroBatchList, MicroBatchSpec
+
+    shared = torch.arange(8, dtype=torch.float32).reshape(2, 4)
+    rows = []
+    for value in (shared, shared + 10):
+        rows.append(
+            {
+                "input_ids": torch.tensor([1, 2]),
+                "max_seqlen": 2,
+                "pixel_values": torch.full((20, 4), -1.0),
+                "image_grid_thw": torch.tensor([[1, 2, 2]]),
+                "multi_modal_input": [{"pixel_values": value}, {"pixel_values": value}],
+            }
+        )
+    original_images = [item for row in rows for item in row["multi_modal_input"]]
+    batch = {
+        "input_ids": torch.ones(2, 2),
+        "attention_mask": torch.ones(2, 2),
+        "multi_modal_input": original_images,
+    }
+    spec = MicroBatchSpec(max_tokens_per_mb=4)
+    mb_list = MicroBatchList(
+        data=batch,
+        mb_spec=spec,
+        mbs=rows,
+        group_lens=[2, 2],
+        padded_mbs=[dict(row) for row in rows],
+        padding_lengths=[0, 0],
+        padded_to_lengths=[2, 2],
+        old_cu_seqlens_list=[None, None],
+    )
+    engine = module.MegatronEngine.__new__(module.MegatronEngine)
+    engine.parallel_strategy = SimpleNamespace(
+        pipeline_parallel_size=1, context_parallel_size=1, tensor_parallel_size=1
+    )
+    engine.bridge_cls = "megatron-bridge"
+    engine.enable_tree_training = False
+    engine.enable_fp8 = False
+    engine.is_vision_model = True
+    engine.sequence_packing_mode = SequencePackingMode.MODEL_THD
+    engine.config = SimpleNamespace(mb_spec=spec, pad_to_maximum=False)
+    engine.logger = MagicMock()
+    monkeypatch.setattr(module.mpu, "get_data_parallel_group", lambda: None)
+    monkeypatch.setattr(
+        module, "split_padded_tensor_dict_into_mb_list", lambda *args, **kwargs: mb_list
+    )
+    monkeypatch.setattr(module, "pack_tensor_dict", lambda row: row)
+    monkeypatch.setattr(
+        module,
+        "prepare_microbatches_for_sequence_layout",
+        lambda value, **kwargs: value,
+    )
+    cat = MagicMock(wraps=torch.cat)
+    monkeypatch.setattr(torch, "cat", cat)
+
+    prepared = engine._prepare_mb_list(batch)
+
+    cat.assert_not_called()
+    assert "pixel_values" not in prepared.padded_mbs[0]
+    assert "multi_modal_input" not in prepared.mbs[0]
+    assert "pixel_values" not in prepared.mbs[0]
+    # A top-level-only grid is retained; only the overridden pixels are dropped.
+    assert prepared.padded_mbs[0]["image_grid_thw"] is rows[0]["image_grid_thw"]
+    source = next(iter(prepared))
+    assert source.padded_mb["multi_modal_input"][0]["pixel_values"] is shared
+    # Two VPP chunks can consume the same CPU source without popping its data.
+    for _ in range(2):
+        staged = prepare_vision_microbatch(source)
+        torch.testing.assert_close(
+            staged.padded_mb["pixel_values"], shared.repeat(2, 1), rtol=0, atol=0
+        )
+        assert "multi_modal_input" not in staged.padded_mb
+        assert "pixel_values" not in staged.orig_mb
+        device_mb = staged.to("meta")
+        assert device_mb.padded_mb["pixel_values"].device.type == "meta"
+        assert source.padded_mb["multi_modal_input"][0]["pixel_values"] is shared
+        assert shared.device.type == "cpu"
+    assert cat.call_count == 2
+    assert "multi_modal_input" in source.padded_mb
+    assert "pixel_values" not in source.padded_mb
+    assert "pixel_values" not in prepared.padded_mbs[1]
+    assert batch["multi_modal_input"] is original_images
+    assert original_images[0]["pixel_values"] is shared
+
+
+@pytest.mark.parametrize("is_vision_model", [False, True])
+@pytest.mark.parametrize("payload_kind", ["missing", "empty", "top_level"])
+def test_text_forward_keeps_original_microbatch_staging(
+    monkeypatch, is_vision_model, payload_kind
+):
+    """Ordinary text and empty-image VLM input never enter lazy vision assembly."""
+    from areal.engine import megatron_engine as module
+    from areal.utils.data import MicroBatchItem, MicroBatchList, MicroBatchSpec
+
+    row = {
+        "input_ids": torch.tensor([1, 2]),
+        "max_seqlen": 2,
+        "cu_seqlens": torch.tensor([0, 2], dtype=torch.int32),
+    }
+    if payload_kind == "empty":
+        row["multi_modal_input"] = [{}, {"pixel_values": torch.empty(0)}]
+    elif payload_kind == "top_level":
+        row["pixel_values"] = torch.ones(2, 4)
+    batch = MicroBatchList(
+        data={},
+        mb_spec=MicroBatchSpec(),
+        mbs=[row],
+        padded_mbs=[dict(row)],
+        group_lens=[2],
+        padding_lengths=[0],
+        padded_to_lengths=[2],
+    )
+    engine = module.MegatronEngine.__new__(module.MegatronEngine)
+    engine._ensure_ready = lambda: None
+    engine._r3_enabled = False
+    engine._r3_pending_routed_experts = None
+    engine._r3_pending_valid = None
+    engine.tf_config = SimpleNamespace(num_moe_experts=None)
+    engine.mcore_config = SimpleNamespace(enable_mtp_training=False)
+    engine.process_group_initialized = True
+    engine._cpu_group = object()
+    engine.is_vision_model = is_vision_model
+    engine.enable_tree_training = False
+    engine.device = "cpu"
+    engine.model = [object()]
+    staged = []
+
+    class StagingReached(Exception):
+        pass
+
+    def to(source, *args, **kwargs):
+        staged.append(source)
+        raise StagingReached
+
+    def schedule(**kwargs):
+        kwargs["forward_step_func"](kwargs["data_iterator"], kwargs["model"])
+
+    monkeypatch.setattr(module, "get_forward_backward_func", lambda: schedule)
+    monkeypatch.setattr(MicroBatchItem, "to", to)
+    # Transport validation has separate distributed coverage; this test stops
+    # at microbatch staging without initializing a process group.
+    validate = MagicMock()
+    monkeypatch.setattr(module, "validate_transport_padding", validate)
+    lazy = MagicMock(side_effect=AssertionError("text path entered vision preparation"))
+    monkeypatch.setattr(module, "prepare_vision_microbatch", lazy)
+
+    with pytest.raises(StagingReached):
+        engine.forward_backward_batch(batch, lambda *args: None, forward_only=True)
+
+    validate.assert_called_once_with(
+        batch, has_internal_objectives=False, cpu_group=engine.cpu_group
+    )
+    lazy.assert_not_called()
+    assert staged[0].orig_mb is row
+    assert staged[0].padded_mb is batch.padded_mbs[0]
+
+
+@pytest.mark.parametrize("with_text_row", [False, True])
+def test_lazy_vision_matches_eager_preparation_and_retains_source(with_text_row):
+    """Keep image/video ordering and CP sequence metadata across repeat consumers."""
+    from areal.engine.megatron_utils.packed_context_parallel import (
+        extract_vision_from_multi_modal,
+        prepare_vision_microbatch,
+    )
+    from areal.utils.data import MicroBatchItem
+
+    images = [
+        {"pixel_values": torch.ones(2, 4), "image_grid_thw": torch.tensor([[1, 1, 2]])},
+        {
+            "pixel_values": torch.full((3, 4), 2.0),
+            "video_grid_thw": torch.tensor([[3, 1, 1]]),
+        },
+    ]
+    if with_text_row:
+        images.insert(1, {})
+    padded = {
+        "input_ids": torch.arange(8),
+        "multi_modal_input": images,
+        "cu_seqlens": torch.tensor([0, 4, 8], dtype=torch.int32),
+        "max_seqlen": 4,
+    }
+    source = MicroBatchItem({"loss_mask": torch.ones(8)}, padded, 0, None, 8)
+    eager_orig, eager_padded = dict(source.orig_mb), dict(source.padded_mb)
+    extract_vision_from_multi_modal(eager_orig, eager_padded)
+    for _ in range(2):
+        result = prepare_vision_microbatch(source)
+        assert result.orig_mb.keys() == eager_orig.keys()
+        assert result.padded_mb.keys() == eager_padded.keys()
+        for key, value in eager_padded.items():
+            if torch.is_tensor(value):
+                torch.testing.assert_close(result.padded_mb[key], value, rtol=0, atol=0)
+        assert result.padded_mb["cu_seqlens"] is padded["cu_seqlens"]
+        assert source.padded_mb["multi_modal_input"] is images
 
 
 class TestUnwrapToGptModel:
@@ -344,6 +786,200 @@ class TestPackedContextParallelForward:
         assert call["packed_seq_params"] is None
         assert output.shape == (5, 4)
 
+    @pytest.mark.parametrize("cp_rank", [0, 1])
+    def test_model_thd_mtp_alignment_matches_bridge_after_padding(
+        self, monkeypatch, cp_rank
+    ):
+        from areal.api.cli_args import MicroBatchSpec
+        from areal.engine.core.model import SequencePackingMode
+        from areal.engine.megatron_utils import packed_context_parallel as packing
+        from areal.utils.data import MicroBatchList
+
+        bridge_utils = pytest.importorskip(
+            "megatron.bridge.models.qwen_vl.modelling_qwen3_vl.utils"
+        )
+        for module in (packing, bridge_utils):
+            monkeypatch.setattr(
+                module.mpu, "get_tensor_model_parallel_world_size", lambda: 2
+            )
+            monkeypatch.setattr(
+                module.mpu, "get_context_parallel_world_size", lambda: 2
+            )
+            monkeypatch.setattr(
+                module.mpu, "get_context_parallel_rank", lambda: cp_rank
+            )
+        ids = torch.arange(1, 21)
+        mask = torch.ones_like(ids)
+        mask[[12, 19]] = 0
+        mb = {
+            "input_ids": ids,
+            "loss_mask": mask,
+            "cu_seqlens": torch.tensor([0, 13, 20], dtype=torch.int32),
+            "max_seqlen": 13,
+        }
+        batches = MicroBatchList(
+            data=mb, mb_spec=MicroBatchSpec(), mbs=[mb], group_lens=[20]
+        )
+        prepared = packing.prepare_microbatches_for_sequence_layout(
+            batches, SequencePackingMode.MODEL_THD, pad_to_maximum=False, seq_align_to=8
+        ).padded_mbs[0]
+        assert prepared["cu_seqlens"].tolist() == [0, 16, 24]
+        assert prepared["loss_mask"].sum() == 18
+        padded_ids, validity, _, _ = packing._reconstruct_padded_2d(
+            prepared["input_ids"], prepared["cu_seqlens"], prepared["max_seqlen"]
+        )
+        bridge_ids, bridge_packed = bridge_utils.preprocess_packed_seqs(
+            padded_ids, validity
+        )
+        padded_mask = torch.zeros_like(padded_ids)
+        padded_mask[validity] = prepared["loss_mask"]
+        expected_mask, _ = bridge_utils.preprocess_packed_seqs(padded_mask, validity)
+        actual_mask = packing._prepare_mtp_loss_mask(
+            prepared["loss_mask"],
+            padded_ids,
+            validity,
+            cu_seqlens=prepared["cu_seqlens"],
+            packed_num_tokens=24,
+            uses_padded_form=True,
+            uses_model_packed_seq=True,
+        )
+        torch.testing.assert_close(
+            bridge_packed.cu_seqlens_q, prepared["cu_seqlens"], rtol=0, atol=0
+        )
+        torch.testing.assert_close(
+            expected_mask.bool(),
+            bridge_ids.ne(0) & bridge_ids.ne(13) & bridge_ids.ne(20),
+        )
+        torch.testing.assert_close(
+            actual_mask.bool(), expected_mask.bool(), rtol=0, atol=0
+        )
+
+    @pytest.mark.parametrize("cp_size", [2, 4])
+    @pytest.mark.parametrize("model_packed", [False, True])
+    def test_packed_mtp_mask_uses_input_ids_cp_zigzag_layout(
+        self, monkeypatch, cp_size, model_packed
+    ):
+        """Packed MTP masks must follow input_ids on every CP rank."""
+        from areal.engine.megatron_utils import packed_context_parallel
+
+        seq_lengths = [4 * cp_size, 2 * cp_size]
+        cu_seqlens = torch.tensor(
+            [0, seq_lengths[0], sum(seq_lengths)], dtype=torch.int32
+        )
+        input_ids = torch.arange(sum(seq_lengths), dtype=torch.long)
+        loss_mask = input_ids.remainder(3).ne(0)
+
+        monkeypatch.setattr(
+            packed_context_parallel.mpu,
+            "get_context_parallel_world_size",
+            lambda: cp_size,
+        )
+        monkeypatch.setattr(
+            packed_context_parallel.mpu,
+            "get_tensor_model_parallel_world_size",
+            lambda: 1,
+        )
+        monkeypatch.setattr(
+            packed_context_parallel.mpu,
+            "is_pipeline_last_stage",
+            lambda **_kwargs: True,
+        )
+
+        for cp_rank in range(cp_size):
+            monkeypatch.setattr(
+                packed_context_parallel.mpu,
+                "get_context_parallel_rank",
+                lambda rank=cp_rank: rank,
+            )
+            expected_ids = []
+            offset = 0
+            for seq_len in seq_lengths:
+                half_chunk = seq_len // (2 * cp_size)
+                expected_ids.extend(
+                    range(
+                        offset + half_chunk * cp_rank,
+                        offset + half_chunk * (cp_rank + 1),
+                    )
+                )
+                expected_ids.extend(
+                    range(
+                        offset + seq_len - half_chunk * (cp_rank + 1),
+                        offset + seq_len - half_chunk * cp_rank,
+                    )
+                )
+                offset += seq_len
+            expected_ids = torch.tensor(expected_ids, dtype=torch.long)
+
+            model = MagicMock(return_value=torch.ones(1, expected_ids.numel(), 4))
+            output = packed_context_parallel.packed_context_parallel_forward(
+                model,
+                {
+                    "input_ids": input_ids,
+                    "cu_seqlens": cu_seqlens,
+                    "max_seqlen": max(seq_lengths),
+                    "mtp_loss_mask": loss_mask,
+                },
+                gather_cp_output=False,
+                is_vision_model=model_packed,
+                use_model_packed_seq=model_packed,
+            )
+
+            call = model.call_args.kwargs
+            if model_packed:
+                torch.testing.assert_close(
+                    call["input_ids"][call["attention_mask"]],
+                    input_ids,
+                    rtol=0,
+                    atol=0,
+                )
+            else:
+                torch.testing.assert_close(
+                    call["input_ids"].squeeze(0), expected_ids, rtol=0, atol=0
+                )
+            torch.testing.assert_close(
+                call["loss_mask"].squeeze(0),
+                expected_ids.remainder(3).ne(0),
+                rtol=0,
+                atol=0,
+            )
+            assert "mtp_kwargs" not in call
+            assert output.shape == (expected_ids.numel(), 4)
+
+    def test_padded_vlm_mtp_uses_padded_labels_and_mask(self, monkeypatch):
+        """MTP supervision must follow the ordinary VLM padded layout."""
+        from areal.engine.megatron_utils import packed_context_parallel
+
+        model = MagicMock(return_value=torch.ones(2, 3, 4))
+        monkeypatch.setattr(
+            packed_context_parallel.mpu,
+            "is_pipeline_last_stage",
+            lambda **_kwargs: True,
+        )
+
+        output = packed_context_parallel.packed_context_parallel_forward(
+            model,
+            {
+                "input_ids": torch.tensor([10, 11, 12, 20, 21]),
+                "loss_mask": torch.tensor([False, True, True, False, True]),
+                "cu_seqlens": torch.tensor([0, 3, 5], dtype=torch.int32),
+                "max_seqlen": 3,
+                "pixel_values": torch.ones(1, 4),
+                "mtp_loss_mask": torch.tensor([False, True, True, False, True]),
+            },
+            is_vision_model=True,
+        )
+
+        call = model.call_args.kwargs
+        assert call["input_ids"].tolist() == [[10, 11, 12], [20, 21, 0]]
+        assert call["loss_mask"].tolist() == [
+            [False, True, True],
+            [False, True, False],
+        ]
+        assert "mtp_kwargs" not in call
+        assert call["attention_mask"] is None
+        assert call["pixel_values"].shape == (1, 4)
+        assert output.shape == (5, 4)
+
     def test_model_thd_passes_padded_inputs_and_packed_metadata(self, monkeypatch):
         from areal.engine.megatron_utils import packed_context_parallel
 
@@ -381,6 +1017,43 @@ class TestPackedContextParallelForward:
         assert call["packed_seq_params"].cu_seqlens_q.tolist() == [0, 3, 5]
         assert output.shape == (5, 3)
 
+    def test_model_thd_cp_delegates_partitioning_to_bridge(self, monkeypatch):
+        from areal.engine.megatron_utils import packed_context_parallel
+
+        model = MagicMock(return_value=torch.ones(1, 4, 3))
+        monkeypatch.setattr(
+            packed_context_parallel.mpu,
+            "is_pipeline_last_stage",
+            lambda **_kwargs: True,
+        )
+        monkeypatch.setattr(
+            packed_context_parallel.mpu,
+            "get_context_parallel_world_size",
+            lambda: 2,
+        )
+
+        output = packed_context_parallel.packed_context_parallel_forward(
+            model,
+            {
+                "input_ids": torch.tensor([10, 11, 12, 13, 20, 21, 22, 23]),
+                "cu_seqlens": torch.tensor([0, 4, 8], dtype=torch.int32),
+                "max_seqlen": 4,
+            },
+            gather_cp_output=False,
+            is_vision_model=True,
+            use_model_packed_seq=True,
+        )
+
+        call = model.call_args.kwargs
+        assert call["input_ids"].tolist() == [
+            [10, 11, 12, 13],
+            [20, 21, 22, 23],
+        ]
+        assert call["attention_mask"].all()
+        assert call["packed_seq_params"].qkv_format == "thd"
+        assert call["packed_seq_params"].cu_seqlens_q.tolist() == [0, 4, 8]
+        assert output.shape == (4, 3)
+
     def test_hidden_state_mode_bypasses_post_process_and_restores_model(self):
         from areal.engine.megatron_utils import packed_context_parallel
 
@@ -404,6 +1077,41 @@ class TestPackedContextParallelForward:
         assert output.shape == (2, 1, 3)
         assert model.seen_post_process is False
         assert model.post_process is True
+
+    @pytest.mark.parametrize("fail", [False, True])
+    def test_hidden_state_mode_preserves_visual_forward_and_restores_on_error(
+        self, fail
+    ):
+        from areal.engine.megatron_utils.packed_context_parallel import (
+            _hidden_states_output,
+        )
+
+        class VisionWrapper(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.visual = torch.nn.Linear(3, 3, bias=False)
+                self.language_model = torch.nn.Identity()
+                self.language_model.post_process = True
+
+            def forward(self, pixels):
+                assert not self.language_model.post_process
+                features = self.visual(pixels)
+                if fail:
+                    raise RuntimeError("visual forward failed")
+                return self.language_model(features)
+
+        model = VisionWrapper()
+        pixels = torch.ones(2, 3, requires_grad=True)
+        try:
+            with _hidden_states_output(model, True):
+                output = model(pixels)
+                output.sum().backward()
+        except RuntimeError as exc:
+            assert fail and str(exc) == "visual forward failed"
+        assert model.language_model.post_process is True
+        if not fail:
+            assert pixels.grad is not None
+            assert model.visual.weight.grad is not None
 
     def test_padded_lm_head_labels_and_outputs_preserve_sequence_order(self):
         from areal.engine.megatron_engine import (

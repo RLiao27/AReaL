@@ -72,7 +72,7 @@ class AwexSchedulerBridge:
 
     def _require_adapter(self) -> Any:
         if self._adapter is None:
-            from areal.v2.weight_update.awex.sglang_adapter import (
+            from areal.engine.awex.adapters.sglang_adapter import (
                 AwexSGLangAdapter,
             )
 
@@ -83,9 +83,9 @@ class AwexSchedulerBridge:
         if self._result_push is not None:
             self._result_push.send_pyobj(result)
 
-    def awex_report_weight_meta(self) -> None:
+    def awex_report_weight_meta(self, parameter_layout: str = "hf") -> None:
         adapter = self._require_adapter()
-        local_meta = adapter.get_weight_metadata()
+        local_meta = adapter.get_weight_metadata(parameter_layout=parameter_layout)
         s = self._scheduler
 
         # All-gather across TP ranks so rank 0 returns aggregated metadata
@@ -141,7 +141,8 @@ class AwexSchedulerBridge:
 # AReaL additions are between # ---- BEGIN AREAL ---- / # ---- END AREAL ----
 # markers.  Deltas vs upstream:
 #   1. AwexSchedulerBridge(scheduler).bind()   -- awex weight update service
-#   2. PPSchedulerBridge(scheduler, server_args).bind()  -- per-PP-rank NCCL groups
+#   2. MTPDistributedWeightUpdateBridge(...).bind() -- NEXTN draft weight routing
+#   3. PPSchedulerBridge(scheduler, server_args).bind()  -- per-PP-rank NCCL groups
 # ---------------------------------------------------------------------------
 
 
@@ -164,7 +165,10 @@ def areal_run_scheduler_process(
 
     Deltas vs upstream:
       1. After ``Scheduler()`` creation -> ``AwexSchedulerBridge(scheduler).bind()``
-      2. After ``Scheduler()`` creation -> ``PPSchedulerBridge(scheduler, server_args).bind()``
+      2. After ``Scheduler()`` creation ->
+         ``MTPDistributedWeightUpdateBridge(scheduler, server_args).bind()``
+      3. After ``Scheduler()`` creation ->
+         ``PPSchedulerBridge(scheduler, server_args).bind()``
     """
     import signal
 
@@ -186,8 +190,14 @@ def areal_run_scheduler_process(
     )
     from sglang.utils import get_exception_traceback
 
+    from areal.v2.inference_service.sglang.mtp_weight_update_bridge import (
+        MTPDistributedWeightUpdateBridge,
+    )
     from areal.v2.inference_service.sglang.pp_bridge import (
         PPSchedulerBridge,
+    )
+    from areal.v2.inference_service.sglang.routed_experts_compat import (
+        apply_sglang_routed_experts_token_cache_patch,
     )
 
     logger = logging.getLogger(__name__)
@@ -219,6 +229,11 @@ def areal_run_scheduler_process(
 
     # Create a scheduler and run the event loop
     try:
+        # ---- BEGIN AREAL ----
+        if server_args.enable_return_routed_experts:
+            apply_sglang_routed_experts_token_cache_patch()
+        # ---- END AREAL ----
+
         scheduler = Scheduler(
             server_args,
             port_args,
@@ -233,6 +248,7 @@ def areal_run_scheduler_process(
 
         # ---- BEGIN AREAL ----
         AwexSchedulerBridge(scheduler).bind()
+        MTPDistributedWeightUpdateBridge(scheduler, server_args).bind()
         PPSchedulerBridge(scheduler, server_args).bind()
         # ---- END AREAL ----
 

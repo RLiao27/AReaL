@@ -83,6 +83,9 @@ class ModelResponse:
     # MoE routing (only populated when return_routed_experts=True)
     routed_experts: np.ndarray | None = None
 
+    sampler_head_ids: list[list[int]] | None = None
+    sampler_head_logprobs: list[list[float]] | None = None
+
     @property
     def input_len(self) -> int:
         return len(self.input_tokens)
@@ -123,10 +126,8 @@ class ModelResponse:
                     pad_or_eos_len += 1
                 else:
                     break
-            if pad_or_eos_len == len(self.output_tokens):
-                raise ValueError(
-                    "All output_tokens are EOS or PAD tokens; cannot strip stop tokens without removing entire output."
-                )
+            # EOS-only generation has empty visible content. Keep the original
+            # tokens and logprobs in this response for trajectory export.
             return self.output_tokens[:-pad_or_eos_len]
         return self.output_tokens
 
@@ -328,6 +329,12 @@ class HttpGenerationResult:
     output_logprobs: list[float]
     stop_reason: str
     routed_experts: np.ndarray | None = None
+    # Speculative-decoding acceptance metrics (only populated by SGLang when
+    # speculative_algorithm is enabled; read from response meta_info).
+    spec_accept_rate: float | None = None
+    spec_accept_length: float | None = None
+    sampler_head_ids: list[list[int]] | None = None
+    sampler_head_logprobs: list[list[float]] | None = None
 
     def __post_init__(self) -> None:
         if len(self.output_tokens) != len(self.output_logprobs):
@@ -368,6 +375,10 @@ class SaveLoadMeta:
     processor: Optional["AutoProcessor"] = None
     base_model_path: str | None = None
     naive_distributed: bool = False
+    checkpoint_pointer_path: str | None = None
+    checkpoint_pointer_value: str | None = None
+    # Drain the engine's pending async DCP queue before save() returns.
+    wait_for_async_save: bool = False
 
 
 @dataclass
